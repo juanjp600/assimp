@@ -119,7 +119,7 @@ void B3DImporter::InternReadFile(const std::string &pFile, aiScene *pScene, IOSy
 
     // Check whether we can read from the file
     if (file.get() == nullptr) {
-        throw DeadlyImportError("Failed to open B3D file ", pFile, ".");
+        throw DeadlyImportError("Failed to open B3D file " + pFile + ".");
     }
 
     // check whether the .b3d file is large enough to contain
@@ -147,7 +147,7 @@ AI_WONT_RETURN void B3DImporter::Fail(string str) {
 #ifdef DEBUG_B3D
     ASSIMP_LOG_ERROR_F("Error in B3D file data: ", str);
 #endif
-    throw DeadlyImportError("B3D Importer - error in B3D file data: ", str);
+    throw DeadlyImportError("B3D Importer - error in B3D file data: " + str);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -475,17 +475,46 @@ void B3DImporter::ReadBONE(int id) {
 void B3DImporter::ReadKEYS(aiNodeAnim *nodeAnim) {
     vector<aiVectorKey> trans, scale;
     vector<aiQuatKey> rot;
+
+    trans.resize(nodeAnim->mNumPositionKeys); memcpy(trans.data(), nodeAnim->mPositionKeys, sizeof(aiVectorKey)*nodeAnim->mNumPositionKeys);
+    scale.resize(nodeAnim->mNumScalingKeys); memcpy(scale.data(), nodeAnim->mScalingKeys, sizeof(aiVectorKey)*nodeAnim->mNumScalingKeys);
+    rot.resize(nodeAnim->mNumRotationKeys); memcpy(rot.data(), nodeAnim->mRotationKeys, sizeof(aiQuatKey)*nodeAnim->mNumRotationKeys);
+
     int flags = ReadInt();
     while (ChunkSize()) {
         int frame = ReadInt();
         if (flags & 1) {
-            trans.push_back(aiVectorKey(frame, ReadVec3()));
+            bool pushed = false;
+            for (int i=0;i<trans.size();i++) {
+                if (((int)trans[i].mTime) == frame) {
+                    trans[i] = aiVectorKey(frame, ReadVec3());
+                    pushed = true;
+                    break;
+                }
+            }
+            if (!pushed) { trans.push_back(aiVectorKey(frame, ReadVec3())); }
         }
         if (flags & 2) {
-            scale.push_back(aiVectorKey(frame, ReadVec3()));
+            bool pushed = false;
+            for (int i = 0; i < scale.size(); i++) {
+                if (((int)scale[i].mTime) == frame) {
+                    scale[i] = aiVectorKey(frame, ReadVec3());
+                    pushed = true;
+                    break;
+                }
+            }
+            if (!pushed) { scale.push_back(aiVectorKey(frame, ReadVec3())); }
         }
         if (flags & 4) {
-            rot.push_back(aiQuatKey(frame, ReadQuat()));
+            bool pushed = false;
+            for (int i = 0; i < rot.size(); i++) {
+                if (((int)rot[i].mTime) == frame) {
+                    rot[i] = aiQuatKey(frame, ReadQuat());
+                    pushed = true;
+                    break;
+                }
+            }
+            if (!pushed) { rot.push_back(aiQuatKey(frame, ReadQuat())); }
         }
     }
 
@@ -706,7 +735,7 @@ void B3DImporter::ReadBB3D(aiScene *scene) {
             mesh->mBones = to_array(bones);
         }
     }
-
+    
     //nodes
     scene->mRootNode = _nodes[0];
     _nodes.clear(); // node ownership now belongs to scene
