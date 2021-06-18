@@ -2,7 +2,7 @@
 Open Asset Import Library (assimp)
 ----------------------------------------------------------------------
 
-Copyright (c) 2006-2020, assimp team
+Copyright (c) 2006-2021, assimp team
 
 All rights reserved.
 
@@ -42,6 +42,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifndef ASSIMP_BUILD_NO_3MF_IMPORTER
 
 #include "D3MFImporter.h"
+#include "3MFXmlTags.h"
+#include "D3MFOpcPackage.h"
 
 #include <assimp/StringComparison.h>
 #include <assimp/StringUtils.h>
@@ -51,37 +53,101 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assimp/scene.h>
 #include <assimp/DefaultLogger.hpp>
 #include <assimp/IOSystem.hpp>
+#include <assimp/fast_atof.h>
+
 #include <cassert>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include "3MFXmlTags.h"
-#include "D3MFOpcPackage.h"
-#include <assimp/fast_atof.h>
-
 #include <iomanip>
+#include <string.h>
 
 namespace Assimp {
 namespace D3MF {
 
+enum class ResourceType {
+    RT_Object,
+    RT_BaseMaterials,
+    RT_Unknown
+}; // To be extended with other resource types (eg. material extension resources like Texture2d, Texture2dGroup...)
+
+class Resource {
+public:
+    int mId;
+
+    Resource(int id) :
+            mId(id) {
+        // empty
+    }
+
+    virtual ~Resource() {
+        // empty
+    }
+
+    virtual ResourceType getType() const {
+        return ResourceType::RT_Unknown;
+    }
+};
+
+class BaseMaterials : public Resource {
+public:
+    std::vector<aiMaterial *> mMaterials;
+    std::vector<unsigned int> mMaterialIndex;
+
+    BaseMaterials(int id) :
+            Resource(id),
+            mMaterials(),
+            mMaterialIndex() {
+        // empty
+    }
+
+    ~BaseMaterials() = default;
+
+    ResourceType getType() const override {
+        return ResourceType::RT_BaseMaterials;
+    }
+};
+
+struct Component {
+    int mObjectId;
+    aiMatrix4x4 mTransformation;
+};
+
+class Object : public Resource {
+public:
+    std::vector<aiMesh *> mMeshes;
+    std::vector<unsigned int> mMeshIndex;
+    std::vector<Component> mComponents;
+    std::string mName;
+
+    Object(int id) :
+            Resource(id),
+            mName(std::string("Object_") + ai_to_string(id)) {
+        // empty
+    }
+
+    ~Object() = default;
+
+    ResourceType getType() const override {
+        return ResourceType::RT_Object;
+    }
+};
+
 class XmlSerializer {
 public:
-    using MatArray = std::vector<aiMaterial *>;
-    using MatId2MatArray = std::map<unsigned int, std::vector<unsigned int>>;
-
     XmlSerializer(XmlParser *xmlParser) :
-            mMeshes(),
-            mMatArray(),
-            mActiveMatGroup(99999999),
-            mMatId2MatArray(),
+            mResourcesDictionnary(),
+            mMaterialCount(0),
+            mMeshCount(0),
             mXmlParser(xmlParser) {
         // empty
     }
 
     ~XmlSerializer() {
-        // empty
+        for (auto it = mResourcesDictionnary.begin(); it != mResourcesDictionnary.end(); ++it ) {
+            delete it->second;
+        }
     }
 
     void ImportXml(aiScene *scene) {
@@ -89,35 +155,49 @@ public:
             return;
         }
 
-        scene->mRootNode = new aiNode();
-        std::vector<aiNode *> children;
+        scene->mRootNode = new aiNode(XmlTag::RootTag);
 
-        std::string nodeName;
-        XmlNode node = mXmlParser->getRootNode().child("model");
+        XmlNode node = mXmlParser->getRootNode().child(XmlTag::model);
         if (node.empty()) {
             return;
         }
-        XmlNode resNode = node.child("resources");
-        for (XmlNode currentNode = resNode.first_child(); currentNode; currentNode = currentNode.next_sibling()) {
-            const std::string &currentNodeName = currentNode.name();
-            if (currentNodeName == D3MF::XmlTag::object) {
-                children.push_back(ReadObject(currentNode, scene));
-            } else if (currentNodeName == D3MF::XmlTag::build) {
-                //
-            } else if (currentNodeName == D3MF::XmlTag::basematerials) {
+        XmlNode resNode = node.child(XmlTag::resources);
+        for (auto &currentNode : resNode.children()) {
+            const std::string currentNodeName = currentNode.name();
+            if (currentNodeName == XmlTag::object) {
+                ReadObject(currentNode);
+            } else if (currentNodeName == XmlTag::basematerials) {
                 ReadBaseMaterials(currentNode);
-            } else if (currentNodeName == D3MF::XmlTag::meta) {
+            } else if (currentNodeName == XmlTag::meta) {
                 ReadMetadata(currentNode);
             }
         }
 
-        if (scene->mRootNode->mName.length == 0) {
-            scene->mRootNode->mName.Set("3MF");
+        XmlNode buildNode = node.child(XmlTag::build);
+        for (auto &currentNode : buildNode.children()) {
+            const std::string currentNodeName = currentNode.name();
+            if (currentNodeName == XmlTag::item) {
+                int objectId = -1;
+                std::string transformationMatrixStr;
+                aiMatrix4x4 transformationMatrix;
+                getNodeAttribute(currentNode, D3MF::XmlTag::objectid, objectId);
+                bool hasTransform = getNodeAttribute(currentNode, D3MF::XmlTag::transform, transformationMatrixStr);
+
+                auto it = mResourcesDictionnary.find(objectId);
+                if (it != mResourcesDictionnary.end() && it->second->getType() == ResourceType::RT_Object) {
+                    Object *obj = static_cast<Object *>(it->second);
+                    if (hasTransform) {
+                        transformationMatrix = parseTransformMatrix(transformationMatrixStr);
+                    }
+
+                    addObjectToNode(scene->mRootNode, obj, transformationMatrix);
+                }
+            }
         }
 
         // import the metadata
         if (!mMetaData.empty()) {
-            const size_t numMeta(mMetaData.size());
+            const size_t numMeta = mMetaData.size();
             scene->mMetaData = aiMetadata::Alloc(static_cast<unsigned int>(numMeta));
             for (size_t i = 0; i < numMeta; ++i) {
                 aiString val(mMetaData[i].value);
@@ -126,81 +206,191 @@ public:
         }
 
         // import the meshes
-        scene->mNumMeshes = static_cast<unsigned int>(mMeshes.size());
-        scene->mMeshes = new aiMesh *[scene->mNumMeshes]();
-        std::copy(mMeshes.begin(), mMeshes.end(), scene->mMeshes);
-
-        // import the materials
-        scene->mNumMaterials = static_cast<unsigned int>(mMatArray.size());
-        if (0 != scene->mNumMaterials) {
-            scene->mMaterials = new aiMaterial *[scene->mNumMaterials];
-            std::copy(mMatArray.begin(), mMatArray.end(), scene->mMaterials);
-        }
-
-        // create the scene-graph
-        scene->mRootNode->mNumChildren = static_cast<unsigned int>(children.size());
-        scene->mRootNode->mChildren = new aiNode *[scene->mRootNode->mNumChildren]();
-        std::copy(children.begin(), children.end(), scene->mRootNode->mChildren);
-    }
-
-private:
-    aiNode *ReadObject(XmlNode &node, aiScene *scene) {
-        std::unique_ptr<aiNode> nodePtr(new aiNode());
-
-        std::vector<unsigned long> meshIds;
-
-        std::string name, type;
-        pugi::xml_attribute attr = node.attribute(D3MF::XmlTag::id.c_str());
-        if (!attr.empty()) {
-            name = attr.as_string();
-        }
-        attr = node.attribute(D3MF::XmlTag::type.c_str());
-        if (!attr.empty()) {
-            type = attr.as_string();
-        }
-
-        nodePtr->mParent = scene->mRootNode;
-        nodePtr->mName.Set(name);
-
-        size_t meshIdx = mMeshes.size();
-
-        for (XmlNode currentNode = node.first_child(); currentNode; currentNode = currentNode.next_sibling()) {
-            const std::string &currentName = currentNode.name();
-            if (currentName == D3MF::XmlTag::mesh) {
-                auto mesh = ReadMesh(currentNode);
-                mesh->mName.Set(name);
-                mMeshes.push_back(mesh);
-                meshIds.push_back(static_cast<unsigned long>(meshIdx));
-                ++meshIdx;
+        scene->mNumMeshes = static_cast<unsigned int>(mMeshCount);
+        if (scene->mNumMeshes != 0) {
+            scene->mMeshes = new aiMesh *[scene->mNumMeshes]();
+            for (auto it = mResourcesDictionnary.begin(); it != mResourcesDictionnary.end(); ++it) {
+                if (it->second->getType() == ResourceType::RT_Object) {
+                    Object *obj = static_cast<Object *>(it->second);
+                    ai_assert(nullptr != obj);
+                    for (unsigned int i = 0; i < obj->mMeshes.size(); ++i) {
+                        scene->mMeshes[obj->mMeshIndex[i]] = obj->mMeshes[i];
+                    }
+                }
             }
         }
 
-        nodePtr->mNumMeshes = static_cast<unsigned int>(meshIds.size());
+        // import the materials
+        scene->mNumMaterials = mMaterialCount;
+        if (scene->mNumMaterials != 0) {
+            scene->mMaterials = new aiMaterial *[scene->mNumMaterials];
+            for (auto it = mResourcesDictionnary.begin(); it != mResourcesDictionnary.end(); ++it) {
+                if (it->second->getType() == ResourceType::RT_BaseMaterials) {
+                    BaseMaterials *baseMaterials = static_cast<BaseMaterials *>(it->second);
+                    for (unsigned int i = 0; i < baseMaterials->mMaterials.size(); ++i) {
+                        scene->mMaterials[baseMaterials->mMaterialIndex[i]] = baseMaterials->mMaterials[i];
+                    }
+                }
+            }
+        }
+    }
 
-        nodePtr->mMeshes = new unsigned int[nodePtr->mNumMeshes];
+private:
+    void addObjectToNode(aiNode *parent, Object *obj, aiMatrix4x4 nodeTransform) {
+        ai_assert(nullptr != obj);
 
-        std::copy(meshIds.begin(), meshIds.end(), nodePtr->mMeshes);
+        aiNode *sceneNode = new aiNode(obj->mName);
+        sceneNode->mNumMeshes = static_cast<unsigned int>(obj->mMeshes.size());
+        sceneNode->mMeshes = new unsigned int[sceneNode->mNumMeshes];
+        std::copy(obj->mMeshIndex.begin(), obj->mMeshIndex.end(), sceneNode->mMeshes);
 
-        return nodePtr.release();
+        sceneNode->mTransformation = nodeTransform;
+        if (nullptr != parent) {
+            parent->addChildren(1, &sceneNode);
+        }
+
+        for (size_t i = 0; i < obj->mComponents.size(); ++i) {
+            Component c = obj->mComponents[i];
+            auto it = mResourcesDictionnary.find(c.mObjectId);
+            if (it != mResourcesDictionnary.end() && it->second->getType() == ResourceType::RT_Object) {
+                addObjectToNode(sceneNode, static_cast<Object *>(it->second), c.mTransformation);
+            }
+        }
+    }
+
+    bool getNodeAttribute(const XmlNode &node, const std::string &attribute, std::string &value) {
+        pugi::xml_attribute objectAttribute = node.attribute(attribute.c_str());
+        if (!objectAttribute.empty()) {
+            value = objectAttribute.as_string();
+            return true;
+        }
+
+        return false;
+    }
+
+    bool getNodeAttribute(const XmlNode &node, const std::string &attribute, int &value) {
+        std::string strValue;
+        bool ret = getNodeAttribute(node, attribute, strValue);
+        if (ret) {
+            value = std::atoi(strValue.c_str());
+            return true;
+        } 
+
+        return false;
+    }
+
+    aiMatrix4x4 parseTransformMatrix(std::string matrixStr) {
+        // split the string
+        std::vector<float> numbers;
+        std::string currentNumber;
+        for (size_t i = 0; i < matrixStr.size(); ++i) {
+            const char c = matrixStr[i];
+            if (c == ' ') {
+                if (currentNumber.size() > 0) {
+                    float f = std::stof(currentNumber);
+                    numbers.push_back(f);
+                    currentNumber.clear();
+                }
+            } else {
+                currentNumber.push_back(c);
+            }
+        }
+        if (currentNumber.size() > 0) {
+            const float f = std::stof(currentNumber);
+            numbers.push_back(f);
+        }
+
+        aiMatrix4x4 transformMatrix;
+        transformMatrix.a1 = numbers[0];
+        transformMatrix.b1 = numbers[1];
+        transformMatrix.c1 = numbers[2];
+        transformMatrix.d1 = 0;
+
+        transformMatrix.a2 = numbers[3];
+        transformMatrix.b2 = numbers[4];
+        transformMatrix.c2 = numbers[5];
+        transformMatrix.d2 = 0;
+
+        transformMatrix.a3 = numbers[6];
+        transformMatrix.b3 = numbers[7];
+        transformMatrix.c3 = numbers[8];
+        transformMatrix.d3 = 0;
+
+        transformMatrix.a4 = numbers[9];
+        transformMatrix.b4 = numbers[10];
+        transformMatrix.c4 = numbers[11];
+        transformMatrix.d4 = 1;
+
+        return transformMatrix;
+    }
+
+    void ReadObject(XmlNode &node) {
+        int id = -1, pid = -1, pindex = -1;
+        bool hasId = getNodeAttribute(node, XmlTag::id, id);
+        bool hasPid = getNodeAttribute(node, XmlTag::pid, pid);
+        bool hasPindex = getNodeAttribute(node, XmlTag::pindex, pindex);
+        if (!hasId) {
+            return;
+        }
+
+        Object *obj = new Object(id);
+
+        for (XmlNode &currentNode : node.children()) {
+            const std::string &currentName = currentNode.name();
+            if (currentName == D3MF::XmlTag::mesh) {
+                auto mesh = ReadMesh(currentNode);
+                mesh->mName.Set(ai_to_string(id));
+
+                if (hasPid) {
+                    auto it = mResourcesDictionnary.find(pid);
+                    if (hasPindex && it != mResourcesDictionnary.end() && it->second->getType() == ResourceType::RT_BaseMaterials) {
+                        BaseMaterials *materials = static_cast<BaseMaterials *>(it->second);
+                        mesh->mMaterialIndex = materials->mMaterialIndex[pindex];
+                    }
+                }
+
+                obj->mMeshes.push_back(mesh);
+                obj->mMeshIndex.push_back(mMeshCount);
+                mMeshCount++;
+            } else if (currentName == D3MF::XmlTag::components) {
+                for (XmlNode &currentSubNode : currentNode.children()) {
+                    const std::string subNodeName = currentSubNode.name();
+                    if (subNodeName == D3MF::XmlTag::component) {
+                        int objectId = -1;
+                        std::string componentTransformStr;
+                        aiMatrix4x4 componentTransform;
+                        if (getNodeAttribute(currentSubNode, D3MF::XmlTag::transform, componentTransformStr)) {
+                            componentTransform = parseTransformMatrix(componentTransformStr);
+                        }
+
+                        if (getNodeAttribute(currentSubNode, D3MF::XmlTag::objectid, objectId)) {
+                            obj->mComponents.push_back({ objectId, componentTransform });
+                        }
+                    }
+                }
+            }
+        }
+
+        mResourcesDictionnary.insert(std::make_pair(id, obj));
     }
 
     aiMesh *ReadMesh(XmlNode &node) {
         aiMesh *mesh = new aiMesh();
-        for (XmlNode currentNode = node.first_child(); currentNode; currentNode = currentNode.next_sibling()) {
-            const std::string &currentName = currentNode.name();
-            if (currentName == D3MF::XmlTag::vertices) {
+
+        for (XmlNode &currentNode : node.children()) {
+            const std::string currentName = currentNode.name();
+            if (currentName == XmlTag::vertices) {
                 ImportVertices(currentNode, mesh);
-            } else if (currentName == D3MF::XmlTag::triangles) {
+            } else if (currentName == XmlTag::triangles) {
                 ImportTriangles(currentNode, mesh);
             }
-
         }
 
         return mesh;
     }
 
     void ReadMetadata(XmlNode &node) {
-        pugi::xml_attribute attribute = node.attribute(D3MF::XmlTag::meta_name.c_str());
+        pugi::xml_attribute attribute = node.attribute(D3MF::XmlTag::meta_name);
         const std::string name = attribute.as_string();
         const std::string value = node.value();
         if (name.empty()) {
@@ -215,9 +405,9 @@ private:
 
     void ImportVertices(XmlNode &node, aiMesh *mesh) {
         std::vector<aiVector3D> vertices;
-        for (XmlNode currentNode = node.first_child(); currentNode; currentNode = currentNode.next_sibling()) {
-            const std::string &currentName = currentNode.name();
-            if (currentName == D3MF::XmlTag::vertex) {
+        for (XmlNode &currentNode : node.children()) {
+            const std::string currentName = currentNode.name();
+            if (currentName == XmlTag::vertex) {
                 vertices.push_back(ReadVertex(currentNode));
             }
         }
@@ -229,23 +419,34 @@ private:
 
     aiVector3D ReadVertex(XmlNode &node) {
         aiVector3D vertex;
-        vertex.x = ai_strtof(node.attribute(D3MF::XmlTag::x.c_str()).as_string(), nullptr);
-        vertex.y = ai_strtof(node.attribute(D3MF::XmlTag::y.c_str()).as_string(), nullptr);
-        vertex.z = ai_strtof(node.attribute(D3MF::XmlTag::z.c_str()).as_string(), nullptr);
+        vertex.x = ai_strtof(node.attribute(XmlTag::x).as_string(), nullptr);
+        vertex.y = ai_strtof(node.attribute(XmlTag::y).as_string(), nullptr);
+        vertex.z = ai_strtof(node.attribute(XmlTag::z).as_string(), nullptr);
 
         return vertex;
     }
 
     void ImportTriangles(XmlNode &node, aiMesh *mesh) {
         std::vector<aiFace> faces;
-        for (XmlNode currentNode = node.first_child(); currentNode; currentNode = currentNode.next_sibling()) {
-            const std::string &currentName = currentNode.name();
-            if (currentName == D3MF::XmlTag::triangle) {
-                faces.push_back(ReadTriangle(currentNode));
-                const char *pidToken = currentNode.attribute(D3MF::XmlTag::p1.c_str()).as_string();
-                if (nullptr != pidToken) {
-                    int matIdx(std::atoi(pidToken));
-                    mesh->mMaterialIndex = matIdx;
+        for (XmlNode &currentNode : node.children()) {
+            const std::string currentName = currentNode.name();
+            if (currentName == XmlTag::triangle) {
+                aiFace face = ReadTriangle(currentNode);
+                faces.push_back(face);
+
+                int pid = 0, p1 = 0;
+                bool hasPid = getNodeAttribute(currentNode, D3MF::XmlTag::pid, pid);
+                bool hasP1 = getNodeAttribute(currentNode, D3MF::XmlTag::p1, p1);
+
+                if (hasPid && hasP1) {
+                    auto it = mResourcesDictionnary.find(pid);
+                    if (it != mResourcesDictionnary.end()) {
+                        if (it->second->getType() == ResourceType::RT_BaseMaterials) {
+                            BaseMaterials *baseMaterials = static_cast<BaseMaterials *>(it->second);
+                            mesh->mMaterialIndex = baseMaterials->mMaterialIndex[p1];
+                        }
+                        // TODO: manage the separation into several meshes if the triangles of the mesh do not all refer to the same material
+                    }
                 }
             }
         }
@@ -262,34 +463,29 @@ private:
 
         face.mNumIndices = 3;
         face.mIndices = new unsigned int[face.mNumIndices];
-        face.mIndices[0] = static_cast<unsigned int>(std::atoi(node.attribute(D3MF::XmlTag::v1.c_str()).as_string()));
-        face.mIndices[1] = static_cast<unsigned int>(std::atoi(node.attribute(D3MF::XmlTag::v2.c_str()).as_string()));
-        face.mIndices[2] = static_cast<unsigned int>(std::atoi(node.attribute(D3MF::XmlTag::v3.c_str()).as_string()));
+        face.mIndices[0] = static_cast<unsigned int>(std::atoi(node.attribute(XmlTag::v1).as_string()));
+        face.mIndices[1] = static_cast<unsigned int>(std::atoi(node.attribute(XmlTag::v2).as_string()));
+        face.mIndices[2] = static_cast<unsigned int>(std::atoi(node.attribute(XmlTag::v3).as_string()));
 
         return face;
     }
 
     void ReadBaseMaterials(XmlNode &node) {
-        std::vector<unsigned int> MatIdArray;
-        const char *baseMaterialId = node.attribute(D3MF::XmlTag::basematerials_id.c_str()).as_string();
-        if (nullptr != baseMaterialId) {
-            unsigned int id = std::atoi(baseMaterialId);
-            const size_t newMatIdx(mMatArray.size());
-            if (id != mActiveMatGroup) {
-                mActiveMatGroup = id;
-                MatId2MatArray::const_iterator it(mMatId2MatArray.find(id));
-                if (mMatId2MatArray.end() == it) {
-                    MatIdArray.clear();
-                    mMatId2MatArray[id] = MatIdArray;
-                } else {
-                    MatIdArray = it->second;
+        int id = -1;
+        if (getNodeAttribute(node, D3MF::XmlTag::basematerials_id, id)) {
+            BaseMaterials *baseMaterials = new BaseMaterials(id);
+
+            for (XmlNode &currentNode : node.children()) {
+                const std::string currentName = currentNode.name();
+                if (currentName == XmlTag::basematerials_base) {
+                    baseMaterials->mMaterialIndex.push_back(mMaterialCount);
+                    baseMaterials->mMaterials.push_back(readMaterialDef(currentNode, id));
+                    ++mMaterialCount;
                 }
             }
-            MatIdArray.push_back(static_cast<unsigned int>(newMatIdx));
-            mMatId2MatArray[mActiveMatGroup] = MatIdArray;
-        }
 
-        mMatArray.push_back(readMaterialDef(node));
+            mResourcesDictionnary.insert(std::make_pair(id, baseMaterials));
+        }
     }
 
     bool parseColor(const char *color, aiColor4D &diffuse) {
@@ -298,81 +494,66 @@ private:
         }
 
         //format of the color string: #RRGGBBAA or #RRGGBB (3MF Core chapter 5.1.1)
-        const size_t len(strlen(color));
+        const size_t len = strlen(color);
         if (9 != len && 7 != len) {
             return false;
         }
 
         const char *buf(color);
-        if ('#' != *buf) {
+        if ('#' != buf[0]) {
             return false;
         }
-        ++buf;
-        char comp[3] = { 0, 0, '\0' };
 
-        comp[0] = *buf;
-        ++buf;
-        comp[1] = *buf;
-        ++buf;
-        diffuse.r = static_cast<ai_real>(strtol(comp, nullptr, 16)) / ai_real(255.0);
+        char r[3] = { buf[1], buf[2], '\0' };
+        diffuse.r = static_cast<ai_real>(strtol(r, nullptr, 16)) / ai_real(255.0);
 
-        comp[0] = *buf;
-        ++buf;
-        comp[1] = *buf;
-        ++buf;
-        diffuse.g = static_cast<ai_real>(strtol(comp, nullptr, 16)) / ai_real(255.0);
+        char g[3] = { buf[3], buf[4], '\0' };
+        diffuse.g = static_cast<ai_real>(strtol(g, nullptr, 16)) / ai_real(255.0);
 
-        comp[0] = *buf;
-        ++buf;
-        comp[1] = *buf;
-        ++buf;
-        diffuse.b = static_cast<ai_real>(strtol(comp, nullptr, 16)) / ai_real(255.0);
+        char b[3] = { buf[5], buf[6], '\0' };
+        diffuse.b = static_cast<ai_real>(strtol(b, nullptr, 16)) / ai_real(255.0);
 
         if (7 == len)
             return true;
-        comp[0] = *buf;
-        ++buf;
-        comp[1] = *buf;
-        ++buf;
-        diffuse.a = static_cast<ai_real>(strtol(comp, nullptr, 16)) / ai_real(255.0);
+
+        char a[3] = { buf[7], buf[8], '\0' };
+        diffuse.a = static_cast<ai_real>(strtol(a, nullptr, 16)) / ai_real(255.0);
 
         return true;
     }
 
     void assignDiffuseColor(XmlNode &node, aiMaterial *mat) {
-        const char *color = node.attribute(D3MF::XmlTag::basematerials_displaycolor.c_str()).as_string();
+        const char *color = node.attribute(XmlTag::basematerials_displaycolor).as_string();
         aiColor4D diffuse;
         if (parseColor(color, diffuse)) {
             mat->AddProperty<aiColor4D>(&diffuse, 1, AI_MATKEY_COLOR_DIFFUSE);
         }
     }
 
-    aiMaterial *readMaterialDef(XmlNode &node) {
-        aiMaterial *mat(nullptr);
-        const char *name(nullptr);
-        const std::string nodeName = node.name();
-        if (nodeName == D3MF::XmlTag::basematerials_base) {
-            name = node.attribute(D3MF::XmlTag::basematerials_name.c_str()).as_string();
-            std::string stdMatName;
-            aiString matName;
-            std::string strId(to_string(mActiveMatGroup));
-            stdMatName += "id";
-            stdMatName += strId;
-            stdMatName += "_";
-            if (nullptr != name) {
-                stdMatName += std::string(name);
-            } else {
-                stdMatName += "basemat";
-            }
-            matName.Set(stdMatName);
+    aiMaterial *readMaterialDef(XmlNode &node, unsigned int basematerialsId) {
+        aiMaterial *material = new aiMaterial();
+        material->mNumProperties = 0;
+        std::string name;
+        bool hasName = getNodeAttribute(node, D3MF::XmlTag::basematerials_name, name);
 
-            mat = new aiMaterial;
-            mat->AddProperty(&matName, AI_MATKEY_NAME);
-
-            assignDiffuseColor(node, mat);
+        std::string stdMaterialName;
+        const std::string strId(ai_to_string(basematerialsId));
+        stdMaterialName += "id";
+        stdMaterialName += strId;
+        stdMaterialName += "_";
+        if (hasName) {
+            stdMaterialName += std::string(name);
+        } else {
+            stdMaterialName += "basemat_";
+            stdMaterialName += ai_to_string(mMaterialCount - basematerialsId);
         }
 
-        return mat;
+        aiString assimpMaterialName(stdMaterialName);
+        material->AddProperty(&assimpMaterialName, AI_MATKEY_NAME);
+
+        assignDiffuseColor(node, material);
+
+        return material;
     }
 
 private:
@@ -381,14 +562,14 @@ private:
         std::string value;
     };
     std::vector<MetaEntry> mMetaData;
-    std::vector<aiMesh *> mMeshes;
-    MatArray mMatArray;
-    unsigned int mActiveMatGroup;
-    MatId2MatArray mMatId2MatArray;
+    std::map<unsigned int, Resource *> mResourcesDictionnary;
+    unsigned int mMaterialCount, mMeshCount;
     XmlParser *mXmlParser;
 };
 
 } //namespace D3MF
+
+using namespace D3MF;
 
 static const aiImporterDesc desc = {
     "3mf Importer",
@@ -423,7 +604,7 @@ bool D3MFImporter::CanRead(const std::string &filename, IOSystem *pIOHandler, bo
         if (!ZipArchiveIOSystem::isZipArchive(pIOHandler, filename)) {
             return false;
         }
-        D3MF::D3MFOpcPackage opcPackage(pIOHandler, filename);
+        D3MFOpcPackage opcPackage(pIOHandler, filename);
         return opcPackage.validate();
     }
 
@@ -439,11 +620,11 @@ const aiImporterDesc *D3MFImporter::GetInfo() const {
 }
 
 void D3MFImporter::InternReadFile(const std::string &filename, aiScene *pScene, IOSystem *pIOHandler) {
-    D3MF::D3MFOpcPackage opcPackage(pIOHandler, filename);
+    D3MFOpcPackage opcPackage(pIOHandler, filename);
 
     XmlParser xmlParser;
     if (xmlParser.parse(opcPackage.RootStream())) {
-        D3MF::XmlSerializer xmlSerializer(&xmlParser);
+        XmlSerializer xmlSerializer(&xmlParser);
         xmlSerializer.ImportXml(pScene);
     }
 }

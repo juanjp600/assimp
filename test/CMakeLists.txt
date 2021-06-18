@@ -1,7 +1,7 @@
 # Open Asset Import Library (assimp)
 # ----------------------------------------------------------------------
 #
-# Copyright (c) 2006-2020, assimp team
+# Copyright (c) 2006-2021, assimp team
 #
 # All rights reserved.
 #
@@ -36,7 +36,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 #----------------------------------------------------------------------
-cmake_minimum_required( VERSION 3.0 )
+cmake_minimum_required( VERSION 3.10 )
 
 INCLUDE_DIRECTORIES(
     ${Assimp_SOURCE_DIR}/test/unit
@@ -220,8 +220,12 @@ if(ASSIMP_HUNTER_ENABLED)
     find_package(GTest CONFIG REQUIRED)
     target_link_libraries(unit GTest::gtest_main GTest::gmock)
 else()
-    target_sources(unit PUBLIC ../contrib/gtest/src/gtest-all.cc)
+    target_sources(unit PUBLIC ${Assimp_SOURCE_DIR}/contrib/gtest/src/gtest-all.cc)
 endif()
+
+IF (ASSIMP_BUILD_DRACO)
+  ADD_DEFINITIONS( -DASSIMP_ENABLE_DRACO )
+ENDIF()
 
 TARGET_USE_COMMON_OUTPUT_DIRECTORY(unit)
 
@@ -231,6 +235,8 @@ add_definitions(-DASSIMP_TEST_MODELS_NONBSD_DIR="${CMAKE_CURRENT_LIST_DIR}/model
 SET_PROPERTY( TARGET assimp PROPERTY DEBUG_POSTFIX ${CMAKE_DEBUG_POSTFIX} )
 
 IF( WIN32 )
+    SET( platform_libs )
+ELSEIF(ANDROID)
     SET( platform_libs )
 ELSE()
     SET( platform_libs pthread )

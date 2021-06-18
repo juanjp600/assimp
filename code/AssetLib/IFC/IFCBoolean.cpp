@@ -2,7 +2,7 @@
 Open Asset Import Library (assimp)
 ----------------------------------------------------------------------
 
-Copyright (c) 2006-2020, assimp team
+Copyright (c) 2006-2021, assimp team
 All rights reserved.
 
 Redistribution and use of this software in source and binary forms,
@@ -715,7 +715,7 @@ void ProcessBoolean(const Schema_2x3::IfcBooleanResult &boolean, TempMesh &resul
     //   DIFFERENCE
     if (const Schema_2x3::IfcBooleanResult *const clip = boolean.ToPtr<Schema_2x3::IfcBooleanResult>()) {
         if (clip->Operator != "DIFFERENCE") {
-            IFCImporter::LogWarn("encountered unsupported boolean operator: " + (std::string)clip->Operator);
+            IFCImporter::LogWarn("encountered unsupported boolean operator: ", (std::string)clip->Operator);
             return;
         }
 
@@ -756,7 +756,7 @@ void ProcessBoolean(const Schema_2x3::IfcBooleanResult &boolean, TempMesh &resul
             ProcessBooleanExtrudedAreaSolidDifference(as, result, first_operand, conv);
         }
     } else {
-        IFCImporter::LogWarn("skipping unknown IfcBooleanResult entity, type is " + boolean.GetClassName());
+        IFCImporter::LogWarn("skipping unknown IfcBooleanResult entity, type is ", boolean.GetClassName());
     }
 }
 

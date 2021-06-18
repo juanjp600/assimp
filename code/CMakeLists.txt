@@ -1,7 +1,7 @@
 # Open Asset Import Library (assimp)
 # ----------------------------------------------------------------------
 #
-# Copyright (c) 2006-2020, assimp team
+# Copyright (c) 2006-2021, assimp team
 #
 # All rights reserved.
 #
@@ -43,7 +43,7 @@
 # 3) Add libassimp using the file lists (eliminates duplication of file names between
 #    source groups and library command)
 #
-cmake_minimum_required( VERSION 3.0 )
+cmake_minimum_required( VERSION 3.10 )
 SET( HEADER_PATH ../include/assimp )
 
 if(NOT ANDROID AND ASSIMP_ANDROID_JNIIOSYSTEM)
@@ -298,7 +298,6 @@ SET(ASSIMP_EXPORTERS_DISABLED "") # disabled exporters list (used to print)
 
 ADD_ASSIMP_IMPORTER( AMF
   AssetLib/AMF/AMFImporter.hpp
-  AssetLib/AMF/AMFImporter_Macro.hpp
   AssetLib/AMF/AMFImporter_Node.hpp
   AssetLib/AMF/AMFImporter.cpp
   AssetLib/AMF/AMFImporter_Geometry.cpp
@@ -665,6 +664,10 @@ if (NOT ASSIMP_NO_EXPORT)
     AssetLib/3MF/D3MFExporter.h
     AssetLib/3MF/D3MFExporter.cpp)
 
+  ADD_ASSIMP_EXPORTER( PBRT
+    Pbrt/PbrtExporter.h
+    Pbrt/PbrtExporter.cpp)
+
   ADD_ASSIMP_EXPORTER( ASSJSON
     AssetLib/Assjson/cencode.c
     AssetLib/Assjson/cencode.h
@@ -920,6 +923,7 @@ IF(ASSIMP_HUNTER_ENABLED)
   find_package(minizip CONFIG REQUIRED)
 ELSE()
   SET( unzip_SRCS
+    ../contrib/unzip/crypt.c
     ../contrib/unzip/crypt.h
     ../contrib/unzip/ioapi.c
     ../contrib/unzip/ioapi.h
@@ -1015,7 +1019,7 @@ ENDIF()
 # RT-extensions is used in "contrib/Open3DGC/o3dgcTimer.h" for collecting statistics. Pointed file
 # has implementation for different platforms: WIN32, __MACH__ and other ("else" block).
 FIND_PACKAGE(RT QUIET)
-IF (NOT ASSIMP_HUNTER_ENABLED AND (RT_FOUND OR MSVC))
+IF (NOT ASSIMP_HUNTER_ENABLED AND (RT_FOUND OR WIN32))
   SET( ASSIMP_IMPORTER_GLTF_USE_OPEN3DGC 1 )
   ADD_DEFINITIONS( -DASSIMP_IMPORTER_GLTF_USE_OPEN3DGC=1 )
 ELSE ()
@@ -1033,7 +1037,10 @@ ELSE()
   INCLUDE_DIRECTORIES( "../contrib" )
   INCLUDE_DIRECTORIES( "../contrib/pugixml/src" )
   ADD_DEFINITIONS( -DRAPIDJSON_HAS_STDSTRING=1 )
-  ADD_DEFINITIONS( -DRAPIDJSON_NOMEMBERITERATORCLASS )
+  option( ASSIMP_RAPIDJSON_NO_MEMBER_ITERATOR "Suppress rapidjson warning on MSVC (NOTE: breaks android build)" ON )
+  if(ASSIMP_RAPIDJSON_NO_MEMBER_ITERATOR)
+    ADD_DEFINITIONS( -DRAPIDJSON_NOMEMBERITERATORCLASS )
+  endif()
 ENDIF()
 
 # VC2010 fixes
@@ -1113,6 +1120,11 @@ IF (ASSIMP_BUILD_NONFREE_C4D_IMPORTER)
   INCLUDE_DIRECTORIES(${C4D_INCLUDES})
 ENDIF ()
 
+IF (ASSIMP_BUILD_DRACO)
+  INCLUDE_DIRECTORIES(${draco_INCLUDE_DIRS})
+  ADD_DEFINITIONS( -DASSIMP_ENABLE_DRACO )
+ENDIF()
+
 ADD_LIBRARY( assimp ${assimp_src} )
 ADD_LIBRARY(assimp::assimp ALIAS assimp)
 
@@ -1124,6 +1136,9 @@ IF (MSVC)
 ELSE()
   TARGET_COMPILE_OPTIONS(assimp PRIVATE -Werror)
 ENDIF()
+
+# adds C_FLAGS required to compile zip.c on old GCC 4.x compiler
+TARGET_COMPILE_FEATURES(assimp PUBLIC c_std_99)
 
 TARGET_INCLUDE_DIRECTORIES ( assimp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
@@ -1144,8 +1159,15 @@ IF(ASSIMP_HUNTER_ENABLED)
       zip::zip
       pugixml
   )
+  
+  if (ASSIMP_BUILD_DRACO)
+    target_link_libraries(assimp PUBLIC ${draco_LIBRARIES})
+  endif()
 ELSE()
-  TARGET_LINK_LIBRARIES(assimp ${ZLIB_LIBRARIES} ${OPENDDL_PARSER_LIBRARIES} )
+  TARGET_LINK_LIBRARIES(assimp ${ZLIB_LIBRARIES} ${OPENDDL_PARSER_LIBRARIES})
+  if (ASSIMP_BUILD_DRACO)
+    target_link_libraries(assimp ${draco_LIBRARIES})
+  endif()
 ENDIF()
 
 if(ASSIMP_ANDROID_JNIIOSYSTEM)
@@ -1238,23 +1260,16 @@ IF (RT_FOUND AND ASSIMP_IMPORTER_GLTF_USE_OPEN3DGC)
   TARGET_LINK_LIBRARIES(assimp ${RT_LIBRARY})
 ENDIF ()
 
-IF(ASSIMP_HUNTER_ENABLED)
-  INSTALL( TARGETS assimp
-    EXPORT "${TARGETS_EXPORT_NAME}"
-    LIBRARY DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    ARCHIVE DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    RUNTIME DESTINATION ${ASSIMP_BIN_INSTALL_DIR}
-    FRAMEWORK DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    COMPONENT ${LIBASSIMP_COMPONENT}
-    INCLUDES DESTINATION "include")
-ELSE()
+
 INSTALL( TARGETS assimp
-    LIBRARY DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    ARCHIVE DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    RUNTIME DESTINATION ${ASSIMP_BIN_INSTALL_DIR}
-    FRAMEWORK DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
-    COMPONENT ${LIBASSIMP_COMPONENT})
-ENDIF()
+  EXPORT "${TARGETS_EXPORT_NAME}"
+  LIBRARY DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
+  ARCHIVE DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
+  RUNTIME DESTINATION ${ASSIMP_BIN_INSTALL_DIR}
+  FRAMEWORK DESTINATION ${ASSIMP_LIB_INSTALL_DIR}
+  COMPONENT ${LIBASSIMP_COMPONENT}
+  INCLUDES DESTINATION include
+)
 INSTALL( FILES ${PUBLIC_HEADERS} DESTINATION ${ASSIMP_INCLUDE_INSTALL_DIR}/assimp COMPONENT assimp-dev)
 INSTALL( FILES ${COMPILER_HEADERS} DESTINATION ${ASSIMP_INCLUDE_INSTALL_DIR}/assimp/Compiler COMPONENT assimp-dev)
 
